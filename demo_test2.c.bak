@@ -1,0 +1,384 @@
+/*
+ * base_test.c
+ *
+ *  Created on: Feb 22, 2017
+ *      Author: weiwen.gan
+ */
+
+#include <stdio.h>
+#include <sys/io.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/select.h>
+#include <signal.h>
+//add leisj
+#include <sys/mman.h>
+
+#define FLAG_ENABLE 1
+#define FLAG_DISABLE 0
+#define FLAG_UP 1
+#define FLAG_DOWN 0
+
+#define GPIO_MIN_ADDR 0x298
+#define GPIO_MAX_ADDR 0x29A
+#define GPIO_GROUP_SELECT 0x298
+#define GPIO_IO_DIRECTION 0x299
+#define GPIO_DATA 0x29A
+
+#define GPIO_BIT_P0 0x01
+#define GPIO_BIT_P1 0x02
+#define GPIO_BIT_P2 0x04
+#define GPIO_BIT_P3 0x08
+#define GPIO_BIT_P4 0x10
+#define GPIO_BIT_P5 0x20
+#define GPIO_BIT_P6 0x40
+#define GPIO_BIT_P7 0x80
+
+
+#define GPIO_FLAG_IO_ALL_OUTPUT 0x00
+#define GPIO_FLAG_IO_ALL_INPUT 0xFF
+
+// P0&P1 as input (0000 0011)
+#define GPIO_FLAG_IO_CONFIG 0x03
+
+// button press time span 100ms
+#define BTN_PRESS_TIME 100
+// button press time release 500ms
+#define BTN_RELEASE_DELAY_TIME 500
+
+// led flash default timestamp 500ms
+#define LED_FLASH_TIME_DEFAULT 500
+// flash status retain time
+#define LED_FLASH_RETAIN_TIME  5000
+
+// timestamp for main loop, 5ms
+#define GPIO_MAIN_TIMESTAMP 10
+
+typedef struct led_status_control {
+	int status;    // 0: off, 1:on, 2:flash
+	int save_status; // 0:off, 1:on
+	int flash_status; // 0:off, 1:on  (using at flash)
+	int flash_span_time;
+	int flash_retain_time;
+	int flash_retain_counter;
+	int flash_on_counter;
+	int flash_off_counter;
+} LED_STATUS;
+
+//add leisj
+typedef struct{
+  int  flag; // 0:无消息, 1:来自deamon, 2:发往deamon
+  char message[20]; // start:启动, success:启动成功, stop:停止, over:停止完成, error:出错
+}control_message;
+
+void sig_handler(const int sig)
+{
+	// release GPIO control
+	ioperm(GPIO_MIN_ADDR, GPIO_MAX_ADDR, FLAG_DISABLE);
+
+	printf("SIGINT handled.\n");
+	printf("Info: Now stop GPIO demo.\n");
+
+	exit(EXIT_SUCCESS);
+}
+
+void init_led_status();
+unsigned char led_status_update_process(LED_STATUS* dev_led, unsigned char oldData, unsigned char gpio_bit);
+void set_led_flash(LED_STATUS* dev_led);
+
+LED_STATUS dev_led_1;
+LED_STATUS dev_led_2;
+LED_STATUS dev_led_3;
+LED_STATUS dev_led_4;
+
+int main() {
+
+	/* handle SIGINT */
+	signal(SIGINT, sig_handler);
+
+	// get GPIO control
+	ioperm(GPIO_MIN_ADDR, GPIO_MAX_ADDR, FLAG_ENABLE);
+
+	// GPIO main setting
+	outb(0x04, GPIO_GROUP_SELECT);
+	outb(GPIO_FLAG_IO_CONFIG, GPIO_IO_DIRECTION);
+
+	// LED initialize
+	init_led_status();
+
+	unsigned char ioData = 0x00;
+	unsigned char tempData = 0x00;
+	unsigned char newIoData = 0x00;
+	int p0_low_counter = 0;
+	int p0_low_release_delay = 0;
+	int p1_low_counter = 0;
+	int p1_low_release_delay = 0;
+	int btn_press_time = BTN_PRESS_TIME / GPIO_MAIN_TIMESTAMP;
+	int btn_release_delay_time = BTN_RELEASE_DELAY_TIME / GPIO_MAIN_TIMESTAMP;
+
+        // add leisj
+        //加电初始状态
+        dev_led_1.status = 0;//绿灯灭
+        dev_led_2.status = 1;//红灯亮
+        dev_led_3.status = 0;//橙灯灭
+        control_message *cm_map;
+        cm_map=(control_message*)mmap(NULL,sizeof(control_message)*2,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0); //共享内存，一个接收，一个发送
+        memset(cm_map,0x00,sizeof(control_message)*2);
+        if(fork() == 0)//fork一个接收deamon消息的子进程
+        {
+               while(1){
+               sleep(2);
+               if((*cm_map).flag >0){
+               printf("child read: control message is %s\n",(*cm_map).message);
+               }
+
+               if((*cm_map).flag==0){
+               //do nothing
+               }else if(memcmp((*(cm_map)).message,"start",5)==0){
+                     set_led_flash(&dev_led_1);//绿灯闪
+                     dev_led_2.status = 0;//红灯灭
+                     dev_led_3.status = 0;//橙灯灭
+               }else if(memcmp((*(cm_map)).message,"success",7)==0){
+                     dev_led_1.status = 1;//绿灯亮
+                     dev_led_2.status = 0;//红灯灭
+                     dev_led_3.status = 0;//橙灯灭
+               }else if(memcmp((*(cm_map)).message,"stop",4)==0){
+                     dev_led_1.status = 0;//绿灯灭
+                     set_led_flash(&dev_led_2);//红灯闪
+                     dev_led_3.status = 0;//橙灯灭
+               }else if(memcmp((*(cm_map)).message,"over",4)==0){
+                     dev_led_1.status = 0;//绿灯灭
+                     dev_led_2.status = 1;//红灯亮
+                     dev_led_3.status = 0;//橙灯灭
+               }else if(memcmp((*(cm_map)).message,"error",5)==0){
+                     dev_led_1.status = 0;//绿灯灭
+                     dev_led_2.status = 0;//红灯灭
+                     dev_led_3.status = 1;//橙灯亮
+               }else{
+                     //printf("no meaning %s\n",(*cm_map).message);
+               }
+               (*cm_map).flag=0; //处理完消息置0
+               }
+
+        }
+        if(fork() == 0)//fork一个发送deamon消息的子进程
+        {
+               while(1){
+               sleep(2);//每2秒读共享内存看看是否有需要发送的消息
+               if((*(cm_map+1)).flag >0){
+               printf("child send: control message is %s\n",(*(cm_map+1)).message);
+               }
+
+               if((*(cm_map+1)).flag==0){
+                 //do nothing
+               }else if(memcmp((*(cm_map+1)).message,"start",4)==0){
+                 //send("start");
+                 printf("send start to deamon\n");
+               }else if(memcmp((*(cm_map+1)).message,"stop",4)==0){
+                 //send("stop");
+                 printf("send stop to deamon\n");
+               }else{
+                 printf("no meaning %s\n",(*cm_map).message);
+               }
+               (*(cm_map+1)).flag=0; //处理完消息置0
+               }
+        }
+	// main loop
+	while(1) {
+
+		// get status data from GPIO
+		ioData = inb(GPIO_DATA);
+
+		// event detect
+		tempData = ioData & GPIO_BIT_P0;
+		p0_low_counter = (tempData > 0 ? 0 : (p0_low_counter + 1));
+		tempData = ioData & GPIO_BIT_P1;
+		p1_low_counter = (tempData > 0 ? 0 : (p1_low_counter + 1));
+
+
+		////////////////////////////////////////////////////////////////////////
+		// GPIO business process
+		////////////////////////////////////////////////////////////////////////
+
+		// Button 0 (P0)
+		if(p0_low_counter > btn_press_time && p0_low_release_delay == 0) {
+			p0_low_release_delay = btn_release_delay_time;
+
+			// button 0 (P0) click event process
+			printf("Button 0 click.\n");
+			// add custom process here
+                        // add leisj
+                        memset(cm_map+1,0x00,sizeof(control_message));
+                        (*(cm_map+1)).flag = 2;
+                        memcpy((*(cm_map+1)).message, "start",5);
+		}
+		// Button 2 (P1)
+		if(p1_low_counter > btn_press_time && p1_low_release_delay == 0) {
+			p1_low_release_delay = btn_release_delay_time;
+
+			// button 1 (P1) click event process
+			printf("Button 1 click.\n");
+			// add custom process here
+                        // add leisj
+                        memset(cm_map+1,0x00,sizeof(control_message));
+                        (*(cm_map+1)).flag = 2;
+                        memcpy((*(cm_map+1)).message, "stop",4);
+		}
+
+		newIoData = ioData;
+
+		// LED 1 (P2)
+		tempData = ioData & GPIO_BIT_P2;
+		tempData = led_status_update_process(&dev_led_1, tempData, GPIO_BIT_P2);
+		newIoData = tempData | ((~GPIO_BIT_P2) & newIoData);
+
+		// LED 2 (P3)
+		tempData = ioData & GPIO_BIT_P3;
+		tempData = led_status_update_process(&dev_led_2, tempData, GPIO_BIT_P3);
+		newIoData = tempData | ((~GPIO_BIT_P3) & newIoData);
+
+		// LED 3 (P4)
+		tempData = ioData & GPIO_BIT_P4;
+		tempData = led_status_update_process(&dev_led_3, tempData, GPIO_BIT_P4);
+		newIoData = tempData | ((~GPIO_BIT_P4) & newIoData);
+
+		// LED 4 (P6)
+		tempData = ioData & GPIO_BIT_P6;
+		tempData = led_status_update_process(&dev_led_4, tempData, GPIO_BIT_P6);
+		newIoData = tempData | ((~GPIO_BIT_P6) & newIoData);
+
+		// Update LED status
+		outb(newIoData, GPIO_DATA);
+
+
+		////////////////////////////////////////////////////////////////////////
+		////////////////////////////////////////////////////////////////////////
+
+		// delay counter
+		p0_low_release_delay = (p0_low_release_delay > 0 ? (p0_low_release_delay - 1) : 0);
+		p1_low_release_delay = (p1_low_release_delay > 0 ? (p1_low_release_delay - 1) : 0);
+
+		//sleep 1msxn,
+		usleep(1000 * GPIO_MAIN_TIMESTAMP);
+	}
+
+	// never go here
+	ioperm(GPIO_MIN_ADDR, GPIO_MAX_ADDR, FLAG_DISABLE);
+
+	return 0;
+}
+
+// LED light status initialize.(must invoke after GPIO direction setting)
+void init_led_status()
+{
+	unsigned char ioData = 0x00;
+	ioData = inb(GPIO_DATA);
+
+	// clear output bit
+	ioData = ioData & (GPIO_BIT_P0 | GPIO_BIT_P1); // ioData & 0x03
+
+	// LED 1
+	dev_led_1.status = 2;
+	dev_led_1.flash_span_time = LED_FLASH_TIME_DEFAULT;
+	dev_led_1.flash_retain_time = LED_FLASH_RETAIN_TIME;
+	dev_led_1.flash_retain_counter = 0;
+	dev_led_1.flash_off_counter = 0;
+	dev_led_1.flash_on_counter = 0;
+	dev_led_1.save_status = dev_led_1.status;
+
+	// LED 2
+	dev_led_2.status = 1;
+	dev_led_2.flash_span_time = LED_FLASH_TIME_DEFAULT;
+	dev_led_2.flash_retain_time = LED_FLASH_RETAIN_TIME;
+	dev_led_2.flash_retain_counter = 0;
+	dev_led_2.flash_off_counter = 0;
+	dev_led_2.flash_on_counter = 0;
+	dev_led_2.save_status = dev_led_2.status;
+
+	// LED 3
+	dev_led_3.status = 1;
+	dev_led_3.flash_span_time = LED_FLASH_TIME_DEFAULT;
+	dev_led_3.flash_retain_time = LED_FLASH_RETAIN_TIME;
+	dev_led_3.flash_retain_counter = 0;
+	dev_led_3.flash_off_counter = 0;
+	dev_led_3.flash_on_counter = 0;
+	dev_led_3.save_status = dev_led_3.status;
+
+	// LED 4
+	dev_led_4.status = 1;
+	dev_led_4.flash_span_time = LED_FLASH_TIME_DEFAULT;
+	dev_led_4.flash_retain_time = LED_FLASH_RETAIN_TIME;
+	dev_led_4.flash_retain_counter = 0;
+	dev_led_4.flash_off_counter = 0;
+	dev_led_4.flash_on_counter = 0;
+	dev_led_4.save_status = dev_led_4.status;
+
+	// Now just support on or off
+	if(dev_led_1.status == 1)
+		ioData = ioData | GPIO_BIT_P2;
+	if(dev_led_2.status == 1)
+		ioData = ioData | GPIO_BIT_P3;
+	if(dev_led_3.status == 1)
+		ioData = ioData | GPIO_BIT_P4;
+	if(dev_led_4.status == 1)
+		ioData = ioData | GPIO_BIT_P6;
+
+	// output data
+	outb(ioData, GPIO_DATA);
+}
+
+// Update LED GPIO bit data.
+unsigned char led_status_update_process(LED_STATUS* dev_led, unsigned char oldData, unsigned char gpio_bit)
+{
+	unsigned char newData = oldData;
+	if(dev_led->status == 0) {
+		// off
+		newData = 0x00;
+	} else if(dev_led->status == 1) {
+		// on
+		newData = gpio_bit;
+	} else if(dev_led->status == 2) {
+		// flash
+		dev_led->flash_retain_counter --;
+		if(dev_led->flash_retain_counter > 0) {
+			// continue flash
+			if(oldData == gpio_bit) {
+				// current is on
+				dev_led->flash_on_counter --;
+				if(dev_led->flash_on_counter == 0) {
+					newData = 0x00; // turn off
+					dev_led->flash_off_counter = dev_led->flash_span_time / GPIO_MAIN_TIMESTAMP;
+				}
+			} else {
+				// current is off
+				dev_led->flash_off_counter --;
+				if(dev_led->flash_off_counter == 0) {
+					newData = gpio_bit; // turn on
+					dev_led->flash_on_counter = dev_led->flash_span_time / GPIO_MAIN_TIMESTAMP;
+				}
+			}
+		} else {
+			// stop flash
+			dev_led->status = dev_led->save_status;
+			newData = (dev_led->status == 0 ? 0x00 : gpio_bit);
+			dev_led->flash_retain_counter = 0;
+			dev_led->flash_off_counter = 0;
+			dev_led->flash_on_counter = 0;
+		}
+	}
+
+	return newData;
+
+}
+
+void set_led_flash(LED_STATUS* dev_led)
+{
+	dev_led->save_status = dev_led->status;
+	dev_led->flash_retain_counter = dev_led->flash_retain_time / GPIO_MAIN_TIMESTAMP;
+	dev_led->flash_off_counter = dev_led->flash_span_time / GPIO_MAIN_TIMESTAMP;
+	dev_led->flash_on_counter = dev_led->flash_span_time / GPIO_MAIN_TIMESTAMP;
+	dev_led->status = 2;
+}
